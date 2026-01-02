@@ -61,6 +61,8 @@ void cublasCheck(cublasStatus_t status, const char *file, int line)
 #define cublasCheck(status) { cublasCheck((status), __FILE__, __LINE__); }
 
 static cublasComputeType_t cublas_compute_type;
+static cublasGemmAlgo_t cublas_gemm_algo = CUBLAS_GEMM_DEFAULT_TENSOR_OP;
+static int tensor_cores_runtime_enabled = 1;
 cublasHandle_t cublas_handle;
 
 namespace cg = cooperative_groups;
@@ -768,11 +770,19 @@ void matmul_forward(float* out,
                     __half* mp_buffer,
                     size_t mp_buffer_elems,
                     int use_mixed_precision,
+                    int use_cublas_linear,
                     int B, int T, int C, int OC) {
     // Treat row-major (B*T, OC) tensors as column-major (OC, B*T) for cuBLAS calls.
     const float alpha = 1.0f;
     const float beta = 0.0f;
     int rows = B * T;
+    if (!use_cublas_linear) {
+        dim3 block_dim(16, 16);
+        dim3 grid_dim(CEIL_DIV(rows, 128), CEIL_DIV(OC, 128));
+        matmul_forward_kernel4<<<grid_dim, block_dim>>>(out, inp, weight, bias, C, OC);
+        cudaCheck(cudaGetLastError());
+        return;
+    }
     if (use_mixed_precision && weight_mp != NULL && mp_buffer != NULL) {
         size_t elems = (size_t)rows * C;
         if (elems > mp_buffer_elems) {
@@ -798,7 +808,7 @@ void matmul_forward(float* out,
                                  CUDA_R_32F,
                                  OC,
                                  cublas_compute_type,
-                                 CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+                                 cublas_gemm_algo));
     } else {
         cublasCheck(cublasSgemm(cublas_handle,
                                 CUBLAS_OP_T,
@@ -1236,6 +1246,8 @@ typedef struct {
     float mean_loss; // after a forward pass with targets, will be populated with the mean loss
     float* cpu_losses; // CPU buffer to copy the losses to, allocated with cudaMallocHost
     int use_mixed_precision;
+    int use_cublas_linear;
+    int tensor_cores_requested;
     __half* mp_buffer;
     size_t mp_buffer_elems;
 } GPT2;
@@ -1283,6 +1295,8 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     fcloseCheck(model_file);
 
     model->use_mixed_precision = read_env_flag("LLMC_ENABLE_MIXED_PRECISION", 0);
+    model->use_cublas_linear = read_env_flag("LLMC_ENABLE_CUBLAS_LINEAR", 1);
+    model->tensor_cores_requested = read_env_flag("LLMC_ENABLE_TENSOR_CORES", 1);
     model->params_mp_memory = NULL;
     if (model->use_mixed_precision) {
         model->params_mp_memory = malloc_and_point_parameters_half(&model->params_mp, model->param_sizes);
@@ -1427,21 +1441,21 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
         // now do the forward pass
         layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C);
         matmul_forward(scratch, l_ln1, l_qkvw, l_qkvb,
-                   l_qkvw_mp, model->mp_buffer, model->mp_buffer_elems, model->use_mixed_precision,
-                   B, T, C, 3*C);
+               l_qkvw_mp, model->mp_buffer, model->mp_buffer_elems, model->use_mixed_precision, model->use_cublas_linear,
+               B, T, C, 3*C);
         attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH);
         matmul_forward(l_attproj, l_atty, l_attprojw, l_attprojb,
-                   l_attprojw_mp, model->mp_buffer, model->mp_buffer_elems, model->use_mixed_precision,
-                   B, T, C, C);
+               l_attprojw_mp, model->mp_buffer, model->mp_buffer_elems, model->use_mixed_precision, model->use_cublas_linear,
+               B, T, C, C);
         residual_forward(l_residual2, residual, l_attproj, B*T*C);
         layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C);
         matmul_forward(l_fch, l_ln2, l_fcw, l_fcb,
-                   l_fcw_mp, model->mp_buffer, model->mp_buffer_elems, model->use_mixed_precision,
-                   B, T, C, 4*C);
+               l_fcw_mp, model->mp_buffer, model->mp_buffer_elems, model->use_mixed_precision, model->use_cublas_linear,
+               B, T, C, 4*C);
         gelu_forward(l_fch_gelu, l_fch, B*T*4*C);
         matmul_forward(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb,
-                   l_fcprojw_mp, model->mp_buffer, model->mp_buffer_elems, model->use_mixed_precision,
-                   B, T, 4*C, C);
+               l_fcprojw_mp, model->mp_buffer, model->mp_buffer_elems, model->use_mixed_precision, model->use_cublas_linear,
+               B, T, 4*C, C);
         residual_forward(l_residual3, l_residual2, l_fcproj, B*T*C);
     }
 
@@ -1449,7 +1463,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
     layernorm_forward(acts.lnf, acts.lnf_mean, acts.lnf_rstd, residual, params.lnfw, params.lnfb, B, T, C);
     __half* wte_mp = model->use_mixed_precision ? model->params_mp.wte : NULL;
     matmul_forward(acts.output, acts.lnf, params.wte, NULL,
-                   wte_mp, model->mp_buffer, model->mp_buffer_elems, model->use_mixed_precision,
+                   wte_mp, model->mp_buffer, model->mp_buffer_elems, model->use_mixed_precision, model->use_cublas_linear,
                    B, T, C, Vp);
 
     // also forward the cross-entropy loss function if we have the targets
@@ -1785,13 +1799,20 @@ int main(int argc, char *argv[]) {
     cudaGetDeviceProperties(&deviceProp, deviceIdx);
     // setup cuBLAS and cuBLASLt
     cublasCheck(cublasCreate(&cublas_handle));
+    int tensor_cores_flag = read_env_flag("LLMC_ENABLE_TENSOR_CORES", 1);
     // TF32 precision is equivalent to torch.set_float32_matmul_precision('high')
-    int enable_tf32 = deviceProp.major >= 8 ? 1 : 0;
+    int enable_tf32 = (deviceProp.major >= 8) && tensor_cores_flag ? 1 : 0;
     cublas_compute_type = enable_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
     cublasMath_t cublas_math_mode = enable_tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH;
+    if (!tensor_cores_flag) {
+        cublas_math_mode = CUBLAS_DEFAULT_MATH;
+    }
+    tensor_cores_runtime_enabled = tensor_cores_flag && deviceProp.major >= 7;
+    cublas_gemm_algo = tensor_cores_runtime_enabled ? CUBLAS_GEMM_DEFAULT_TENSOR_OP : CUBLAS_GEMM_DEFAULT;
     cublasCheck(cublasSetMathMode(cublas_handle, cublas_math_mode));
     printf("| device                | %-50s |\n", deviceProp.name);
     printf("| TF32                  | %-50s |\n", enable_tf32 ? "enabled" : "disabled");
+    printf("| tensor cores          | %-50s |\n", tensor_cores_runtime_enabled ? "enabled" : "disabled");
     printf("+-----------------------+----------------------------------------------------+\n");
 
     // build the GPT-2 model from a checkpoint
@@ -1805,6 +1826,8 @@ int main(int argc, char *argv[]) {
     printf("| channels C            | %-50d |\n", model.config.channels);
     printf("| num_parameters        | %-50zu |\n", model.num_parameters);
     printf("| mixed_precision       | %-50s |\n", model.use_mixed_precision ? "enabled" : "disabled");
+    printf("| cublas_linear         | %-50s |\n", model.use_cublas_linear ? "enabled" : "disabled");
+    printf("| tensor cores (req)    | %-50s |\n", model.tensor_cores_requested ? "enabled" : "disabled");
     printf("+-----------------------+----------------------------------------------------+\n");
 
     // build DataLoaders for both train and val
