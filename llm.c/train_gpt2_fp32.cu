@@ -1247,7 +1247,6 @@ typedef struct {
     float* cpu_losses; // CPU buffer to copy the losses to, allocated with cudaMallocHost
     int use_mixed_precision;
     int use_cublas_linear;
-    int tensor_cores_requested;
     __half* mp_buffer;
     size_t mp_buffer_elems;
 } GPT2;
@@ -1296,7 +1295,6 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
 
     model->use_mixed_precision = read_env_flag("LLMC_ENABLE_MIXED_PRECISION", 0);
     model->use_cublas_linear = read_env_flag("LLMC_ENABLE_CUBLAS_LINEAR", 1);
-    model->tensor_cores_requested = read_env_flag("LLMC_ENABLE_TENSOR_CORES", 1);
     model->params_mp_memory = NULL;
     if (model->use_mixed_precision) {
         model->params_mp_memory = malloc_and_point_parameters_half(&model->params_mp, model->param_sizes);
@@ -1799,15 +1797,11 @@ int main(int argc, char *argv[]) {
     cudaGetDeviceProperties(&deviceProp, deviceIdx);
     // setup cuBLAS and cuBLASLt
     cublasCheck(cublasCreate(&cublas_handle));
-    int tensor_cores_flag = read_env_flag("LLMC_ENABLE_TENSOR_CORES", 1);
     // TF32 precision is equivalent to torch.set_float32_matmul_precision('high')
-    int enable_tf32 = (deviceProp.major >= 8) && tensor_cores_flag ? 1 : 0;
+    int enable_tf32 = (deviceProp.major >= 8) ? 1 : 0;
     cublas_compute_type = enable_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
     cublasMath_t cublas_math_mode = enable_tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH;
-    if (!tensor_cores_flag) {
-        cublas_math_mode = CUBLAS_DEFAULT_MATH;
-    }
-    tensor_cores_runtime_enabled = tensor_cores_flag && deviceProp.major >= 7;
+    tensor_cores_runtime_enabled = deviceProp.major >= 7;
     cublas_gemm_algo = tensor_cores_runtime_enabled ? CUBLAS_GEMM_DEFAULT_TENSOR_OP : CUBLAS_GEMM_DEFAULT;
     cublasCheck(cublasSetMathMode(cublas_handle, cublas_math_mode));
     printf("| device                | %-50s |\n", deviceProp.name);
@@ -1827,7 +1821,6 @@ int main(int argc, char *argv[]) {
     printf("| num_parameters        | %-50zu |\n", model.num_parameters);
     printf("| mixed_precision       | %-50s |\n", model.use_mixed_precision ? "enabled" : "disabled");
     printf("| cublas_linear         | %-50s |\n", model.use_cublas_linear ? "enabled" : "disabled");
-    printf("| tensor cores (req)    | %-50s |\n", model.tensor_cores_requested ? "enabled" : "disabled");
     printf("+-----------------------+----------------------------------------------------+\n");
 
     // build DataLoaders for both train and val
