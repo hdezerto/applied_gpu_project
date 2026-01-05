@@ -809,7 +809,7 @@ void matmul_forward(float* out,
                                  OC,
                                  cublas_compute_type,
                                  cublas_gemm_algo));
-    } else {
+    } else { //Corrected
         cublasCheck(cublasSgemm(cublas_handle,
                                 CUBLAS_OP_T,
                                 CUBLAS_OP_N,
