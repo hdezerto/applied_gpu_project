@@ -125,6 +125,25 @@ int main(int argc, char *argv[]) {
     if(!logits_ok) { printf("NOT "); }
     printf("OK (LOGITS)\n");
 
+    // choose inference-only at runtime with INFERENCE_ONLY env var
+    if (getenv("INFERENCE_ONLY")) {
+        // Inference-only benchmark: forward pass only, timed
+        const int iters = 20;
+        double total_ms = 0.0;
+        for (int step = 0; step < iters; step++) {
+            struct timespec start, end;
+            clock_gettime(CLOCK_MONOTONIC, &start);
+            gpt2_forward(&model, x, NULL, B, T);
+            clock_gettime(CLOCK_MONOTONIC, &end);
+            double time_elapsed_ms = (end.tv_sec - start.tv_sec) * 1e3 + (end.tv_nsec - start.tv_nsec) / 1e6;
+            total_ms += time_elapsed_ms;
+            double tok_per_s = ((double)B * (double)T) / (time_elapsed_ms / 1e3);
+            printf("step %d: forward-only %f ms (%f tok/s)\n", step, time_elapsed_ms, tok_per_s);
+        }
+        double avg_ms = total_ms / iters;
+        double avg_tok_per_s = ((double)B * (double)T) / (avg_ms / 1e3);
+        printf("avg forward-only: %f ms, tokens/s: %f\n", avg_ms, avg_tok_per_s);
+    } else {
     // let's do 10 training iterations, following the pytorch code
     float losses[10];
     for (int step = 0; step < 10; step++) {
@@ -220,6 +239,7 @@ int main(int argc, char *argv[]) {
 
     // final approval
     printf("overall okay: %d\n", allok);
+    #endif
 
     // free everything
     free(x);
