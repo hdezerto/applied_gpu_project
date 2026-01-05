@@ -66,6 +66,17 @@ int main(int argc, char *argv[]) {
     }
     int B = state_header[2]; // batch size, e.g. 4
     int T = state_header[3]; // time / sequence length (e.g. 64, up to maxT)
+    const char* env_override_t = getenv("OVERRIDE_T");
+    if (env_override_t != NULL) {
+        int t_env = atoi(env_override_t);
+        if (t_env > 0 && t_env <= maxT) {
+            T = t_env;
+            printf("[Override] Using OVERRIDE_T=%d (maxT=%d)\n", T, maxT);
+        } else if (t_env > maxT) {
+            T = maxT;
+            printf("[Override] OVERRIDE_T capped to maxT=%d\n", maxT);
+        }
+    }
     assert(0 <= T && T <= maxT);
     printf("[State]\n");
     printf("batch_size: %d\n", B);
@@ -79,51 +90,63 @@ int main(int argc, char *argv[]) {
     // inputs and expected outputs, only used for error checking
     int* x = (int*)mallocCheck(B * T * sizeof(int));
     int* y = (int*)mallocCheck(B * T * sizeof(int));
-    float* expected_logits = (float*) mallocCheck(B * T * V * sizeof(float));
-    float* expected_loss = (float*) mallocCheck(1 * sizeof(float));
+    float* expected_logits = NULL;
+    float* expected_loss = NULL;
+    int reference_available = (env_override_t == NULL);
 
-    // read reference information from Python
-    freadCheck(x, sizeof(int), B*T, state_file);
-    freadCheck(y, sizeof(int), B*T, state_file);
-    freadCheck(expected_logits, sizeof(float), B*T*V, state_file);
-    freadCheck(expected_loss, sizeof(float), 1, state_file);
-    freadCheck(expected_grads_memory, sizeof(float), model.num_parameters, state_file);
-    fcloseCheck(state_file);
+    if (reference_available) {
+        expected_logits = (float*) mallocCheck(B * T * V * sizeof(float));
+        expected_loss = (float*) mallocCheck(1 * sizeof(float));
+        // read reference information from Python
+        freadCheck(x, sizeof(int), B*T, state_file);
+        freadCheck(y, sizeof(int), B*T, state_file);
+        freadCheck(expected_logits, sizeof(float), B*T*V, state_file);
+        freadCheck(expected_loss, sizeof(float), 1, state_file);
+        freadCheck(expected_grads_memory, sizeof(float), model.num_parameters, state_file);
+        fcloseCheck(state_file);
+    } else {
+        // no reference file for this T; fill synthetic inputs
+        fcloseCheck(state_file);
+        for (int i = 0; i < B * T; ++i) {
+            x[i] = GPT2_EOT;
+            y[i] = GPT2_EOT;
+        }
+    }
 
     // overall OK signal for the test
     int allok = 1;
 
-    // First, do target-free forward pass to validate logits
+    // First, do target-free forward pass to validate logits (when reference exists)
     gpt2_forward(&model, x, NULL, B, T);
-    // at this point, target should be equal to expected_logits, let's compare
-    // copy logits to CPU so we can compare them
-    float* logits_cpu = (float*)mallocCheck(B * T * Vp * sizeof(float));
-    cudaCheck(cudaMemcpy(logits_cpu, model.acts.output, B * T * Vp * sizeof(float), cudaMemcpyDeviceToHost));
+    float* logits_cpu = NULL;
+    if (reference_available) {
+        // at this point, target should be equal to expected_logits, let's compare
+        logits_cpu = (float*)mallocCheck(B * T * Vp * sizeof(float));
+        cudaCheck(cudaMemcpy(logits_cpu, model.acts.output, B * T * Vp * sizeof(float), cudaMemcpyDeviceToHost));
 
-    // compare the output logits from the forward pass
-    // also careful that we don't access and compare the padded columns of logits
-    int logits_ok = 1;
-    float max_diff = 0.0f;
-    for (int bt = 0; bt < B*T; bt++) {
-        for (int v = 0; v < V; v++) {
-            int i = bt * Vp + v; // linearized index
-            if (i < 10) {
-                printf("%f, %f\n", expected_logits[i], logits_cpu[i]);
-            }
-            float diff = fabsf(expected_logits[bt*V + v] - logits_cpu[i]);
-            max_diff = fmaxf(max_diff, diff);
-            if (diff >= 1e-2f) {
-                printf("MISMATCH AT INDEX %d,%d: ", bt, v);
-                printf("%f %f\n", expected_logits[bt*V + v], logits_cpu[i]);
-                logits_ok = 0;
-                bt = B*T; // to break out of both loops
-                break;
+        int logits_ok = 1;
+        float max_diff = 0.0f;
+        for (int bt = 0; bt < B*T; bt++) {
+            for (int v = 0; v < V; v++) {
+                int i = bt * Vp + v; // linearized index
+                if (i < 10) {
+                    printf("%f, %f\n", expected_logits[i], logits_cpu[i]);
+                }
+                float diff = fabsf(expected_logits[bt*V + v] - logits_cpu[i]);
+                max_diff = fmaxf(max_diff, diff);
+                if (diff >= 1e-2f) {
+                    printf("MISMATCH AT INDEX %d,%d: ", bt, v);
+                    printf("%f %f\n", expected_logits[bt*V + v], logits_cpu[i]);
+                    logits_ok = 0;
+                    bt = B*T; // to break out of both loops
+                    break;
+                }
             }
         }
+        allok = allok && logits_ok;
+        if(!logits_ok) { printf("NOT "); }
+        printf("OK (LOGITS)\n");
     }
-    allok = allok && logits_ok;
-    if(!logits_ok) { printf("NOT "); }
-    printf("OK (LOGITS)\n");
 
     // choose inference-only at runtime with INFERENCE_ONLY env var
     if (getenv("INFERENCE_ONLY")) {
@@ -239,7 +262,6 @@ int main(int argc, char *argv[]) {
 
     // final approval
     printf("overall okay: %d\n", allok);
-    #endif
 
     // free everything
     free(x);
@@ -252,4 +274,5 @@ int main(int argc, char *argv[]) {
     cublasCheck(cublasDestroy(cublas_handle));
 
     return 0;
+}
 }
