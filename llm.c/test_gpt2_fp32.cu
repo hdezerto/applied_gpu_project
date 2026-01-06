@@ -1,4 +1,10 @@
 #define TESTING
+// train_gpt2_fp32.cu defines GPT2_EOT only when not TESTING (it gates the sampler/main).
+// The test still needs the EOT token id for synthetic inputs when OVERRIDE_T is used.
+#ifndef GPT2_EOT
+#define GPT2_EOT 50256
+#endif
+
 #include "train_gpt2_fp32.cu"
 
 // poor man's tensor checker
