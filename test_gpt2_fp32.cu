@@ -72,7 +72,7 @@ int main(int argc, char *argv[]) {
     }
     int B = state_header[2]; // batch size, e.g. 4
     int T = state_header[3]; // time / sequence length (e.g. 64, up to maxT)
-    const char* env_override_t = getenv("OVERRIDE_T");
+    const char* env_override_t = getenv("OVERRIDE_T"); // runtime T override for scaling runs
     if (env_override_t != NULL) {
         int t_env = atoi(env_override_t);
         if (t_env > 0 && t_env <= maxT) {
@@ -98,7 +98,7 @@ int main(int argc, char *argv[]) {
     int* y = (int*)mallocCheck(B * T * sizeof(int));
     float* expected_logits = NULL;
     float* expected_loss = NULL;
-    int reference_available = (env_override_t == NULL);
+    int reference_available = (env_override_t == NULL); // skip reference checks when T is overridden
 
     if (reference_available) {
         expected_logits = (float*) mallocCheck(B * T * V * sizeof(float));
@@ -111,7 +111,7 @@ int main(int argc, char *argv[]) {
         freadCheck(expected_grads_memory, sizeof(float), model.num_parameters, state_file);
         fcloseCheck(state_file);
     } else {
-        // no reference file for this T; fill synthetic inputs
+        // no reference at this T; fill synthetic inputs
         fcloseCheck(state_file);
         for (int i = 0; i < B * T; ++i) {
             x[i] = GPT2_EOT;
@@ -154,7 +154,7 @@ int main(int argc, char *argv[]) {
         printf("OK (LOGITS)\n");
     }
 
-    // choose inference-only at runtime with INFERENCE_ONLY env var
+    // Optional inference-only benchmark, controlled by INFERENCE_ONLY
     if (getenv("INFERENCE_ONLY")) {
         // Inference-only benchmark: forward pass only, timed
         const int iters = 20;
