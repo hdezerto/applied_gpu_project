@@ -777,6 +777,7 @@ void matmul_forward(float* out,
     const float beta = 0.0f;
     int rows = B * T;
     if (!use_cublas_linear) {
+        // custom fused kernel
         dim3 block_dim(16, 16);
         dim3 grid_dim(CEIL_DIV(rows, 128), CEIL_DIV(OC, 128));
         matmul_forward_kernel4<<<grid_dim, block_dim>>>(out, inp, weight, bias, C, OC);
@@ -784,6 +785,7 @@ void matmul_forward(float* out,
         return;
     }
     if (use_mixed_precision && weight_mp != NULL && mp_buffer != NULL) {
+        // Tensor Core GEMM with FP16 weights
         size_t elems = (size_t)rows * C;
         if (elems > mp_buffer_elems) {
             printf("Mixed-precision buffer insufficient: needed %zu got %zu\n", elems, mp_buffer_elems);
@@ -809,7 +811,8 @@ void matmul_forward(float* out,
                                  OC,
                                  cublas_compute_type,
                                  cublas_gemm_algo));
-    } else { //Corrected
+    } else {
+        // FP32 cuBLAS GEMM
         cublasCheck(cublasSgemm(cublas_handle,
                                 CUBLAS_OP_T,
                                 CUBLAS_OP_N,
@@ -1245,8 +1248,8 @@ typedef struct {
     int* targets; // the target tokens for the current forward pass
     float mean_loss; // after a forward pass with targets, will be populated with the mean loss
     float* cpu_losses; // CPU buffer to copy the losses to, allocated with cudaMallocHost
-    int use_mixed_precision;
-    int use_cublas_linear;
+    int use_mixed_precision; // env: LLMC_ENABLE_MIXED_PRECISION
+    int use_cublas_linear;   // env: LLMC_ENABLE_CUBLAS_LINEAR
     __half* mp_buffer;
     size_t mp_buffer_elems;
 } GPT2;
@@ -1293,11 +1296,13 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     free(params_memory_cpu);
     fcloseCheck(model_file);
 
+    // env: flip on FP16 weights + Tensor Core GEMMs
     model->use_mixed_precision = read_env_flag("LLMC_ENABLE_MIXED_PRECISION", 0);
-    // Default to the original behavior: use the custom CUDA matmul kernel unless explicitly enabled.
+    // env: swap custom matmul for cuBLAS/cuBLASLt
     model->use_cublas_linear = read_env_flag("LLMC_ENABLE_CUBLAS_LINEAR", 0);
     model->params_mp_memory = NULL;
     if (model->use_mixed_precision) {
+        // FP16 shadow weights for cublasGemmEx
         model->params_mp_memory = malloc_and_point_parameters_half(&model->params_mp, model->param_sizes);
         convert_fp32_to_fp16(model->params_mp_memory, model->params_memory, model->num_parameters);
     }
@@ -1361,6 +1366,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
         cudaCheck(cudaMalloc((void**)&model->targets, B * T * sizeof(int)));
         cudaCheck(cudaMallocHost((void**)&model->cpu_losses, B * T * sizeof(float)));
         if (model->use_mixed_precision) {
+            // staging buffer for FP16 activations
             size_t needed = (size_t)B * T * 4 * C;
             model->mp_buffer_elems = needed;
             cudaCheck(cudaMalloc((void**)&model->mp_buffer, needed * sizeof(__half)));
@@ -1372,14 +1378,15 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
             printf("Model: B=%d T=%d, Desired: B=%d T=%d\n", model->batch_size, model->seq_len, B, T);
             exit(EXIT_FAILURE);
         }
-        if (model->use_mixed_precision) {
-            size_t needed = (size_t)B * T * 4 * C;
-            if (model->mp_buffer == NULL || needed > model->mp_buffer_elems) {
-                if (model->mp_buffer != NULL) { cudaCheck(cudaFree(model->mp_buffer)); }
-                model->mp_buffer_elems = needed;
-                cudaCheck(cudaMalloc((void**)&model->mp_buffer, needed * sizeof(__half)));
+            if (model->use_mixed_precision) {
+                // grow the FP16 staging buffer if shapes change
+                size_t needed = (size_t)B * T * 4 * C;
+                if (model->mp_buffer == NULL || needed > model->mp_buffer_elems) {
+                    if (model->mp_buffer != NULL) { cudaCheck(cudaFree(model->mp_buffer)); }
+                    model->mp_buffer_elems = needed;
+                    cudaCheck(cudaMalloc((void**)&model->mp_buffer, needed * sizeof(__half)));
+                }
             }
-        }
     }
 
     // copy inputs/targets to the model
@@ -1412,6 +1419,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
         float* l_fcprojw = params.fcprojw + l * C * 4*C;
         float* l_fcprojb = params.fcprojb + l * C;
 
+        // FP16 weight views used only when mixed precision is on
         __half* l_qkvw_mp = model->use_mixed_precision ? model->params_mp.qkvw + l * 3*C * C : NULL;
         __half* l_attprojw_mp = model->use_mixed_precision ? model->params_mp.attprojw + l * C * C : NULL;
         __half* l_fcw_mp = model->use_mixed_precision ? model->params_mp.fcw + l * 4*C * C : NULL;
@@ -1439,6 +1447,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
 
         // now do the forward pass
         layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C);
+        // matmul path picked by use_cublas_linear/use_mixed_precision
         matmul_forward(scratch, l_ln1, l_qkvw, l_qkvb,
                l_qkvw_mp, model->mp_buffer, model->mp_buffer_elems, model->use_mixed_precision, model->use_cublas_linear,
                B, T, C, 3*C);
@@ -1796,7 +1805,7 @@ int main(int argc, char *argv[]) {
     cudaCheck(cudaSetDevice(deviceIdx));
     cudaDeviceProp deviceProp;
     cudaGetDeviceProperties(&deviceProp, deviceIdx);
-    // setup cuBLAS and cuBLASLt
+    // setup cuBLAS
     cublasCheck(cublasCreate(&cublas_handle));
     // TF32 precision is equivalent to torch.set_float32_matmul_precision('high')
     int enable_tf32 = (deviceProp.major >= 8) ? 1 : 0;
