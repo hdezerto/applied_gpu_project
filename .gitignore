@@ -1,0 +1,60 @@
+# Build outputs
+build/
+*.o
+*.obj
+*.exe
+*.out
+*.lib
+*.exp
+*.pdb
+train_gpt2
+test_gpt2
+train_gpt2cu
+test_gpt2cu
+train_gpt2fp32cu
+test_gpt2fp32cu
+profile_gpt2cu
+
+# Downloaded model/data artifacts
+*.bin
+*.ckpt
+*.safetensors
+*.pt
+*.pth
+dev/data/tinyshakespeare/
+dev/data/hellaswag/
+dev/data/tinystories/
+dev/data/fineweb*/
+dev/data/mmlu/
+
+# Logs and run outputs
+logs/
+runs/
+wandb/
+*.log
+*.csv
+*.jsonl
+
+# Python caches and virtual environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Temporary files
+tmp/
+temp/

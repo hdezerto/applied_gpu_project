@@ -246,15 +246,34 @@ endif
 # PHONY means these targets will always be executed
 .PHONY: all train_gpt2 test_gpt2 train_gpt2cu test_gpt2cu train_gpt2fp32cu test_gpt2fp32cu profile_gpt2cu
 
-# Add targets
-TARGETS = train_gpt2 test_gpt2
+# Add targets that are present in this trimmed project snapshot.
+TARGETS =
+
+ifneq ($(wildcard train_gpt2.c),)
+  TARGETS += train_gpt2
+endif
+
+ifneq ($(wildcard test_gpt2.c),)
+  TARGETS += test_gpt2
+endif
 
 # Conditional inclusion of CUDA targets
 ifeq ($(NVCC),)
     $(info ✗ nvcc not found, skipping GPU/CUDA builds)
 else
     $(info ✓ nvcc found, including GPU/CUDA support)
-    TARGETS += train_gpt2cu test_gpt2cu train_gpt2fp32cu test_gpt2fp32cu $(NVCC_CUDNN)
+    TARGETS += train_gpt2fp32cu test_gpt2fp32cu
+    ifneq ($(wildcard train_gpt2.cu),)
+      TARGETS += train_gpt2cu
+    endif
+    ifneq ($(wildcard test_gpt2.cu),)
+      TARGETS += test_gpt2cu
+    endif
+    ifneq ($(strip $(NVCC_CUDNN)),)
+      ifneq ($(filter train_gpt2cu test_gpt2cu,$(TARGETS)),)
+        TARGETS += $(NVCC_CUDNN)
+      endif
+    endif
 endif
 
 $(info ---------------------------------------------)
