@@ -41,6 +41,10 @@ The custom FP32 matrix multiplication kernel dominated the baseline GPU runtime,
 
 For forward-only inference scaling with batch size `B = 4`, the mixed-precision path reached up to a 5.66x speedup at sequence length `T = 64` and still achieved a 2.67x speedup at `T = 1024`.
 
+## Report
+
+For the full methodology, profiling results, and discussion, see the [group project report](docs/project-report.pdf).
+
 ## Repository Contents
 
 | Path | Purpose |
